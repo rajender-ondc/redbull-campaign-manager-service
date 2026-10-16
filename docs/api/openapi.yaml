@@ -1,0 +1,1631 @@
+openapi: 3.1.0
+info:
+  title: Campaign Manager (S1 Configuration & Registry) API
+  version: 1.4.0
+  summary: The configuration and registry API that the Marketing UI (S5) calls.
+  description: |
+    S1 holds everything Marketing configures. This document covers **login and users**, **categories**, **channels**
+    and **affiliates**.
+
+    Conventions (see docs/adr/ADR-010 and ADR-012):
+    - JSON property names and query parameters are camelCase (team naming standard, ADR-010).
+    - A success body is wrapped as `{ "data": ... }`. Lists also return `pagination`.
+    - Every error is an RFC 9457 Problem Details document (`application/problem+json`) with a stable `code`.
+    - Single-item responses carry `ETag: "<currentVersionNo>"`. Send that value back in `If-Match` on
+      PATCH or DELETE and the server returns 412 if someone else changed the item first, instead of
+      silently overwriting their change.
+    - Methods a path doesn't support return 405 with an `Allow` header. Unknown URLs return 404 (`ROUTE_NOT_FOUND`).
+
+    Login and access (ADR-015):
+    - Log in with `POST /auth/login`, then send the token on every other request: `Authorization: Bearer <token>`.
+      Only login and forgot password work without a token.
+    - Log out with `POST /auth/logout`: the token it's sent with stops working at once (ADR-016).
+    - Roles: an `admin` changes configuration and manages users; a `user` reads configuration (PRD S5-01).
+    - No token → 401 `AUTHENTICATION_REQUIRED`; an invalid or expired token → 401 `INVALID_TOKEN`;
+      a role that isn't allowed → 403 `FORBIDDEN`.
+    - Every response carries `Cache-Control: no-store`.
+    - ⚠ Forgot password has no verification yet (an accepted risk until email is available; fix before production).
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local development
+security:
+  - bearerAuth: []
+tags:
+  - name: Login
+    description: |
+      Log in, log out, and set a new password when you forget yours. Logging in and forgot password are the only
+      endpoints that need no token; logging out needs the token it ends. The token is an RS256-signed JWT: S1 signs
+      it with its private key, and any service can check it with the public key (ADR-015).
+  - name: Users
+    description: |
+      People who can log in to the Marketing UI. Everyone can read their own profile and change their own password;
+      admins create, list, change and disable users. Users are never deleted, because history shows who changed
+      what. The last active admin can't be disabled or made a user.
+  - name: Categories
+    description: |
+      A category is what a campaign promotes (Grocery, Fashion, …). It supplies:
+      - the default attribution window for new campaigns (PRD S1-02);
+      - the aliases that map the item-category names Buyer Apps send onto it, for category match (PRD S3-14).
+  - name: Channels
+    description: |
+      A channel is a place where an affiliate posts our tracking link (WhatsApp, Telegram, Instagram, Website / blog, …).
+      Each affiliate on a campaign runs on one or more channels, and every affiliate × channel gets its own link,
+      so results can be read per channel (ADR-013). Channels are listed by name.
+  - name: Affiliates
+    description: |
+      An affiliate is a traffic partner network (CashKaro, Admitad, Wishlink, …) that spreads our tracking links
+      and is paid commission on attributed orders (ADR-014). The server gives each affiliate a `code` for its
+      tracking links; the code never changes, not even when the affiliate is renamed. A paused affiliate can't be
+      added to new campaigns; campaigns it's already on keep running.
+paths:
+  /categories:
+    get:
+      tags: [Categories]
+      operationId: listCategories
+      summary: List categories
+      description: Returns categories sorted by name (ignoring letter case), one page at a time.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of categories.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Categories]
+      operationId: createCategory
+      summary: Create a category
+      description: |
+        The server generates the `id`. Names are unique ignoring letter case. Each alias can belong to only one category.
+        `defaultWindowDays` is 7 (the network default) when omitted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreate'
+            example:
+              name: Grocery
+              aliases: [Spices, Snacks]
+      responses:
+        '201':
+          description: Created. `Location` points to the new category.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /categories/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Categories]
+      operationId: getCategory
+      summary: Get one category
+      responses:
+        '200':
+          description: The category.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Categories]
+      operationId: updateCategory
+      summary: Change a category
+      description: |
+        Send only the fields to change; each one replaces the old value (`aliases` is replaced as a whole list).
+        `id` can't be changed. Campaigns copy `defaultWindowDays` when they're created, so changing it here
+        doesn't affect existing campaigns.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdate'
+            example:
+              defaultWindowDays: 10
+      responses:
+        '200':
+          description: The updated category.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CategoryEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Categories]
+      operationId: deleteCategory
+      summary: Delete a category that no campaign uses
+      description: |
+        The delete is permanent. It's refused with 409 `CATEGORY_IN_USE` while any campaign points at the category.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /channels:
+    get:
+      tags: [Channels]
+      operationId: listChannels
+      summary: List channels, optionally searching by name
+      description: |
+        Returns channels sorted by name (ignoring letter case), one page at a time. With `search`, only the
+        channels whose name contains that text are returned, and `pagination` counts only those matches.
+        No match returns an empty page, not an error.
+      parameters:
+        - $ref: '#/components/parameters/ChannelSearch'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of channels.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Channels]
+      operationId: createChannel
+      summary: Create a channel
+      description: The server generates the `id`. Names are unique ignoring letter case.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChannelCreate'
+            example:
+              name: WhatsApp
+      responses:
+        '201':
+          description: Created. `Location` points to the new channel.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /channels/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Channels]
+      operationId: getChannel
+      summary: Get one channel
+      responses:
+        '200':
+          description: The channel.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Channels]
+      operationId: updateChannel
+      summary: Rename a channel
+      description: Send the new `name`. `id` can't be changed.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChannelUpdate'
+            example:
+              name: Website / blog
+      responses:
+        '200':
+          description: The updated channel.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Channels]
+      operationId: deleteChannel
+      summary: Delete a channel that no campaign uses
+      description: |
+        The delete is permanent. It's refused with 409 `CHANNEL_IN_USE` while any campaign has an affiliate
+        running on the channel.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /affiliates:
+    get:
+      tags: [Affiliates]
+      operationId: listAffiliates
+      summary: List affiliates, optionally searching by name and filtering by status
+      description: |
+        Returns affiliates sorted by name (ignoring letter case), one page at a time. `search` and `status` can be
+        combined; `pagination` then counts only the matches. The campaign wizard asks for `status=active`, because
+        a paused affiliate can't be added to new campaigns.
+      parameters:
+        - $ref: '#/components/parameters/AffiliateSearch'
+        - $ref: '#/components/parameters/AffiliateStatus'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of affiliates.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AffiliateList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Affiliates]
+      operationId: createAffiliate
+      summary: Create an affiliate
+      description: |
+        The server generates the `id` and the `code` (e.g. `ckB7XQ` for CashKaro), and every new affiliate is
+        `active`. Names are unique ignoring letter case. `defaultContractWindowDays` is 14 when omitted.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AffiliateCreate'
+            example:
+              name: CashKaro
+              contactEmail: ops@cashkaro.com
+              defaultCommissionRatePercent: 6
+      responses:
+        '201':
+          description: Created. `Location` points to the new affiliate.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AffiliateEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /affiliates/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Affiliates]
+      operationId: getAffiliate
+      summary: Get one affiliate
+      responses:
+        '200':
+          description: The affiliate.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AffiliateEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Affiliates]
+      operationId: updateAffiliate
+      summary: Change, pause or resume an affiliate
+      description: |
+        Send only the fields to change. **Pause** with `{"status": "paused"}` and **resume** with
+        `{"status": "active"}`, alone or with other changes. `contactEmail: null` removes the email.
+        `id` and `code` can't be changed: renaming keeps the code, because tracking links contain it (ADR-014).
+        Changing a default rate or window doesn't change campaigns the affiliate is already on.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AffiliateUpdate'
+            examples:
+              pause:
+                summary: Pause (no longer selectable for new campaigns)
+                value:
+                  status: paused
+              resume:
+                summary: Resume
+                value:
+                  status: active
+              edit:
+                summary: Change the default commission
+                value:
+                  defaultCommissionRatePercent: 6.5
+      responses:
+        '200':
+          description: The updated affiliate.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AffiliateEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    delete:
+      tags: [Affiliates]
+      operationId: deleteAffiliate
+      summary: Delete an affiliate that no campaign uses
+      description: |
+        The delete is permanent. It's refused with 409 `AFFILIATE_IN_USE` while any campaign has the affiliate;
+        pause it instead.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: Deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/login:
+    post:
+      tags: [Login]
+      operationId: logIn
+      summary: Log in and get a token
+      description: |
+        Checks the email and password and, only if both are right, returns a signed token. A wrong email, a wrong
+        password and a disabled account all get the same 401, so accounts can't be discovered. The 5th wrong password
+        in a row locks the account for 15 minutes (423). The response is never cached (`Cache-Control: no-store`,
+        `Pragma: no-cache`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: asha@ondc.org
+              password: Marketing@2026
+      responses:
+        '200':
+          description: Logged in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: '`INVALID_CREDENTIALS`: the email or password is incorrect, or the account is disabled.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/logout:
+    post:
+      tags: [Login]
+      operationId: logOut
+      summary: Log out
+      description: |
+        Ends the session of the token this request is sent with: S1 refuses that token from now on (ADR-016). The
+        user's other sessions keep working; to end all of them, change the password. Any signed-in user can log out,
+        whatever their role. The UI should forget the token whatever the answer.
+      responses:
+        '204':
+          description: Logged out. The token no longer works.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /auth/forgot-password:
+    post:
+      tags: [Login]
+      operationId: resetForgottenPassword
+      summary: Set a new password when you've forgotten yours
+      description: |
+        Sets a new password for the active account with this email. It also clears a lockout, and tokens issued
+        before it stop working. ⚠ There's no verification yet: anyone who knows the email can do this (accepted risk,
+        ADR-015; must be fixed before production).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForgotPasswordRequest'
+            example:
+              email: asha@ondc.org
+              newPassword: Forgot#2026
+      responses:
+        '204':
+          description: The new password is set.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          description: '`USER_NOT_FOUND`: no active account uses this email.'
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: List users (admins)
+      description: Returns users sorted by name (ignoring letter case). `search` matches the name or the email.
+      parameters:
+        - $ref: '#/components/parameters/UserSearch'
+        - $ref: '#/components/parameters/UserRole'
+        - $ref: '#/components/parameters/UserStatus'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: Create a user (admins)
+      description: |
+        Creates an active account. The admin shares the password with the person; there's no forced change at first
+        login. Emails are stored lowercase and are unique.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+            example:
+              name: Ravi Kumar
+              email: ravi@ondc.org
+              role: user
+              password: Welcome@2026
+      responses:
+        '201':
+          description: Created. `Location` points to the new user.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /users/me:
+    get:
+      tags: [Users]
+      operationId: getCurrentUser
+      summary: Get your own profile
+      responses:
+        '200':
+          description: The signed-in user.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /users/me/password:
+    put:
+      tags: [Users]
+      operationId: changeOwnPassword
+      summary: Change your own password
+      description: |
+        Needs your current password; a wrong one is a 400 on `currentPassword` and counts towards the lockout. Tokens
+        issued before the change stop working, so log in again afterwards.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+            example:
+              currentPassword: Welcome@2026
+              newPassword: Changed#2026
+      responses:
+        '204':
+          description: Changed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '423':
+          $ref: '#/components/responses/Locked'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: Get one user (admins)
+      responses:
+        '200':
+          description: The user.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      summary: Change, disable or enable a user (admins)
+      description: |
+        Send only the fields to change. `status: disabled` stops the person from logging in, and their tokens stop
+        working at once. Passwords aren't changed here. The last active admin can't be disabled or made a user
+        (409 `LAST_ADMIN`).
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+            example:
+              status: disabled
+      responses:
+        '200':
+          description: The updated user.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserEnvelope'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '412':
+          $ref: '#/components/responses/PreconditionFailed'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        The `accessToken` from `POST /auth/login`, sent as `Authorization: Bearer <token>`. An RS256-signed JWT with
+        `sub` (user id), `role`, `iss`, `aud`, `iat`, `exp` and `jti`; it holds no personal data. Lasts 60 minutes
+        (provisional).
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: The item's id (a UUID generated by the server).
+      schema:
+        type: string
+        format: uuid
+    ChannelSearch:
+      name: search
+      in: query
+      required: false
+      description: |
+        Lists only the channels whose name contains this text, ignoring letter case: `app` finds "WhatsApp".
+        Characters are matched exactly as typed, so `/` finds "Website / blog" and `.*` has no special meaning.
+        Leading and trailing spaces are ignored, and a blank value lists every channel. Send it at most once.
+      schema:
+        type: string
+        maxLength: 50
+      example: app
+    AffiliateSearch:
+      name: search
+      in: query
+      required: false
+      description: |
+        Lists only the affiliates whose name contains this text, ignoring letter case: `kar` finds "CashKaro".
+        Characters are matched exactly as typed. Leading and trailing spaces are ignored, and a blank value lists
+        every affiliate. Send it at most once.
+      schema:
+        type: string
+        maxLength: 100
+      example: kar
+    AffiliateStatus:
+      name: status
+      in: query
+      required: false
+      description: Lists only `active` or only `paused` affiliates. Omit it to list both.
+      schema:
+        type: string
+        enum: [active, paused]
+    UserSearch:
+      name: search
+      in: query
+      required: false
+      description: Lists only the users whose name or email contains this text, ignoring letter case.
+      schema:
+        type: string
+        maxLength: 254
+    UserRole:
+      name: role
+      in: query
+      required: false
+      description: Lists only admins or only users.
+      schema:
+        type: string
+        enum: [admin, user]
+    UserStatus:
+      name: status
+      in: query
+      required: false
+      description: Lists only active or only disabled users.
+      schema:
+        type: string
+        enum: [active, disabled]
+    Page:
+      name: page
+      in: query
+      description: Page number, starting at 1.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Limit:
+      name: limit
+      in: query
+      description: Items per page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: |
+        Optional. The `ETag` you last received for this item, e.g. `"3"`. If the item has changed
+        since then, the request fails with 412 and nothing is modified. `*` means "any version".
+      schema:
+        type: string
+        pattern: '^(\*|"[0-9]+")$'
+        example: '"3"'
+  headers:
+    ETag:
+      description: The item's `currentVersionNo`, quoted.
+      schema:
+        type: string
+        example: '"1"'
+    Location:
+      description: Path of the created item.
+      schema:
+        type: string
+        format: uri-reference
+        example: /api/v1/categories/0b8f6f4e-3c1a-4d7e-9b2a-5f0c2d9e7a11
+  schemas:
+    Category:
+      type: object
+      required: [id, name, defaultWindowDays, aliases, currentVersionNo, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Generated by the server; never changes.
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: Unique ignoring letter case. Leading and trailing spaces are removed.
+        defaultWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+          description: Default attribution window, in days, for campaigns created in this category.
+        aliases:
+          type: array
+          maxItems: 50
+          description: |
+            Item-category names Buyer Apps send that mean this category. Each is stored trimmed, with
+            repeated spaces collapsed, in lowercase, without duplicates. An alias belongs to one category only.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+        currentVersionNo:
+          type: integer
+          minimum: 1
+          readOnly: true
+          description: Starts at 1 and goes up by 1 on every change. Also sent as the `ETag`.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+      example:
+        id: 0b8f6f4e-3c1a-4d7e-9b2a-5f0c2d9e7a11
+        name: Grocery
+        defaultWindowDays: 7
+        aliases: [spices, snacks]
+        currentVersionNo: 1
+        createdAt: '2026-10-13T10:15:00.000Z'
+        updatedAt: '2026-10-13T10:15:00.000Z'
+    CategoryCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        defaultWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 7
+        aliases:
+          type: array
+          maxItems: 50
+          default: []
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+    CategoryUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        defaultWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+        aliases:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            minLength: 1
+            maxLength: 100
+    CategoryEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Category'
+    CategoryList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Category'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    Channel:
+      type: object
+      required: [id, name, currentVersionNo, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Generated by the server; never changes.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Unique ignoring letter case. Leading and trailing spaces are removed.
+        currentVersionNo:
+          type: integer
+          minimum: 1
+          readOnly: true
+          description: Starts at 1 and goes up by 1 on every change. Also sent as the `ETag`.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+      example:
+        id: 6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f
+        name: WhatsApp
+        currentVersionNo: 1
+        createdAt: '2026-10-14T10:15:00.000Z'
+        updatedAt: '2026-10-14T10:15:00.000Z'
+    ChannelCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+    ChannelUpdate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+    ChannelEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Channel'
+    ChannelList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Channel'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    Affiliate:
+      type: object
+      required: [id, code, name, contactEmail, defaultCommissionRatePercent, defaultContractWindowDays, status, currentVersionNo, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+          description: Generated by the server; never changes.
+        code:
+          type: string
+          pattern: '^[a-z]{2}[BCDFGHJKMNPQRSTVWXZ2-9]{4}$'
+          readOnly: true
+          description: |
+            Used in tracking links. Generated by the server: two lowercase letters from the name's initials, then
+            four characters with no vowels and no look-alikes. Unique ignoring letter case. Never changes, not even
+            when the affiliate is renamed (ADR-014).
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          description: Unique ignoring letter case. Leading and trailing spaces are removed.
+        contactEmail:
+          type: [string, 'null']
+          format: email
+          maxLength: 254
+          description: Stored trimmed and lowercase. Prefills the recipients when Marketing sends a report.
+        defaultCommissionRatePercent:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+          multipleOf: 0.01
+          description: Prefills the commission rate when the affiliate is added to a campaign.
+        defaultContractWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+          description: The contract window, in days, that prefills a campaign; it governs the affiliate's reports.
+        status:
+          type: string
+          enum: [active, paused]
+          description: A paused affiliate can't be added to new campaigns; campaigns it's already on keep running.
+        currentVersionNo:
+          type: integer
+          minimum: 1
+          readOnly: true
+          description: Starts at 1 and goes up by 1 on every change. Also sent as the `ETag`.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+      example:
+        id: 8c1d2e3f-4a5b-4c6d-9e7f-0a1b2c3d4e5f
+        code: ckB7XQ
+        name: CashKaro
+        contactEmail: ops@cashkaro.com
+        defaultCommissionRatePercent: 6
+        defaultContractWindowDays: 14
+        status: active
+        currentVersionNo: 1
+        createdAt: '2026-10-14T10:15:00.000Z'
+        updatedAt: '2026-10-14T10:15:00.000Z'
+    AffiliateCreate:
+      type: object
+      additionalProperties: false
+      required: [name, defaultCommissionRatePercent]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        contactEmail:
+          type: [string, 'null']
+          format: email
+          maxLength: 254
+        defaultCommissionRatePercent:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+          multipleOf: 0.01
+        defaultContractWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+          default: 14
+    AffiliateUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        contactEmail:
+          type: [string, 'null']
+          format: email
+          maxLength: 254
+          description: '`null` removes the email.'
+        defaultCommissionRatePercent:
+          type: number
+          exclusiveMinimum: 0
+          maximum: 100
+          multipleOf: 0.01
+        defaultContractWindowDays:
+          type: integer
+          minimum: 1
+          maximum: 60
+        status:
+          type: string
+          enum: [active, paused]
+          description: '`paused` pauses the affiliate; `active` resumes it.'
+    AffiliateEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Affiliate'
+    AffiliateList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Affiliate'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    Password:
+      type: string
+      minLength: 8
+      maxLength: 64
+      description: |
+        At least 8 characters, with at least one uppercase letter (A–Z), one lowercase letter (a–z), one digit (0–9)
+        and one symbol (any character that isn't a letter, digit or space). At most 64 characters and 72 bytes,
+        because bcrypt ignores anything longer. Each rule that fails gets its own message.
+      example: Marketing@2026
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 64
+    Token:
+      type: object
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken:
+          type: string
+          description: 'Send it as `Authorization: Bearer <accessToken>`. Keep it in memory, never in a URL.'
+        tokenType:
+          type: string
+          const: Bearer
+        expiresIn:
+          type: integer
+          description: Seconds until the token expires.
+          example: 3600
+    TokenEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Token'
+    ForgotPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [email, newPassword]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        newPassword:
+          $ref: '#/components/schemas/Password'
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          type: string
+          minLength: 1
+          maxLength: 64
+        newPassword:
+          $ref: '#/components/schemas/Password'
+    User:
+      type: object
+      required: [id, email, name, role, status, failedAttempts, lockedUntil, createdBy, passwordChangedAt, lastLoginAt, currentVersionNo, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          description: Stored lowercase; unique.
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        role:
+          type: string
+          enum: [admin, user]
+          description: '`admin` changes configuration and manages users; `user` reads configuration.'
+        status:
+          type: string
+          enum: [active, disabled]
+          description: A disabled user can't log in, and their tokens stop working.
+        failedAttempts:
+          type: integer
+          minimum: 0
+          readOnly: true
+          description: Wrong passwords in a row; the 5th locks the account for 15 minutes.
+        lockedUntil:
+          type: [string, 'null']
+          format: date-time
+          readOnly: true
+        createdBy:
+          type: [string, 'null']
+          format: uuid
+          readOnly: true
+          description: The admin who created the account; null for the first admin.
+        passwordChangedAt:
+          type: string
+          format: date-time
+          readOnly: true
+        lastLoginAt:
+          type: [string, 'null']
+          format: date-time
+          readOnly: true
+        currentVersionNo:
+          type: integer
+          minimum: 1
+          readOnly: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+    UserCreate:
+      type: object
+      additionalProperties: false
+      required: [name, email, role, password]
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        role:
+          type: string
+          enum: [admin, user]
+        password:
+          $ref: '#/components/schemas/Password'
+    UserUpdate:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        role:
+          type: string
+          enum: [admin, user]
+        status:
+          type: string
+          enum: [active, disabled]
+    UserEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/User'
+    UserList:
+      type: object
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+    Pagination:
+      type: object
+      required: [page, limit, totalItems, totalPages]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        totalItems:
+          type: integer
+          minimum: 0
+        totalPages:
+          type: integer
+          minimum: 0
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details, extended with a stable `code` and, for validation errors, `errors`.
+      required: [type, title, status, code, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: Identifies the problem type; derived from `code`, e.g. `/problems/category-not-found`.
+        title:
+          type: string
+          description: The HTTP status text, e.g. `Not Found`.
+        status:
+          type: integer
+        code:
+          type: string
+          description: Stable, machine-readable error code. Clients should branch on this, not on `detail`.
+        detail:
+          type: string
+          description: Human-readable explanation of this occurrence.
+        instance:
+          type: string
+          description: The request path that produced the problem.
+        errors:
+          type: array
+          description: Present for `VALIDATION_FAILED`; one entry per invalid field.
+          items:
+            $ref: '#/components/schemas/FieldError'
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: |
+            The invalid field, e.g. `defaultWindowDays`, `aliases.3`, `limit` or `if-match`.
+            `body` means the body as a whole.
+        message:
+          type: string
+  responses:
+    BadRequest:
+      description: |
+        Invalid input. `code` is `VALIDATION_FAILED` (with `errors`) for invalid fields, query parameters,
+        path id or `If-Match`, or `MALFORMED_JSON` when the body isn't valid JSON.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: /problems/validation-failed
+            title: Bad Request
+            status: 400
+            code: VALIDATION_FAILED
+            detail: 2 invalid fields.
+            instance: /api/v1/categories
+            errors:
+              - field: defaultWindowDays
+                message: Must be a whole number from 1 to 60.
+              - field: name
+                message: Required.
+    NotFound:
+      description: 'No item has this id: `CATEGORY_NOT_FOUND`, `CHANNEL_NOT_FOUND`, `AFFILIATE_NOT_FOUND` or `USER_NOT_FOUND`.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: |
+        The request clashes with existing data. `code` is one of:
+        - `CATEGORY_NAME_TAKEN` / `CHANNEL_NAME_TAKEN` / `AFFILIATE_NAME_TAKEN`: another item already has this name
+          (ignoring letter case).
+        - `CATEGORY_ALIAS_TAKEN`: one of the aliases already belongs to another category.
+        - `CATEGORY_IN_USE` / `CHANNEL_IN_USE` / `AFFILIATE_IN_USE`: (DELETE only) a campaign still uses the item.
+        - `USER_EMAIL_TAKEN`: another user already has this email.
+        - `LAST_ADMIN`: the change would leave no active admin.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: |
+        `AUTHENTICATION_REQUIRED`: no token was sent. `INVALID_TOKEN`: the token is invalid or expired, it was logged
+        out, its user is disabled, or the password changed after it was issued. Log in again. Carries
+        `WWW-Authenticate: Bearer`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: '`FORBIDDEN`: your role doesn''t allow this (only admins change configuration and manage users).'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Locked:
+      description: '`ACCOUNT_LOCKED`: 5 wrong passwords in a row lock the account for 15 minutes. `Retry-After` says how many seconds are left.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionFailed:
+      description: '`VERSION_MISMATCH`: the item changed since the version in `If-Match`. Fetch it again and retry.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: '`PAYLOAD_TOO_LARGE`: the body is larger than 100 KB.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: '`UNSUPPORTED_MEDIA_TYPE`: send the body as JSON with `Content-Type: application/json`.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: '`INTERNAL_ERROR`: an unexpected error. No internal details are returned.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: '`SERVICE_UNAVAILABLE`: the database can''t be reached right now. Retry later.'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
